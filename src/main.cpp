@@ -2,8 +2,11 @@
 //
 // Misma logica que la version de Thonny:
 //   - 6 servos con CONFIG_SERVOS identico (min_us/max_us/lim_min/lim_max)
-//   - FIX 1: zona muerta de posicion por servo (necesitaMover)
-//   - FIX 2: movimiento inmediato para el MPU
+//   - MPU: mientras el sensor este inclinado mas alla de ZONA_MUERTA, el servo
+//     avanza MPU_PASO grados por muestra en esa direccion, con movimiento suave.
+//     Eje X gira la base (servo 1), eje Y sube/baja el brazo (servo 2).
+//     (En Thonny FIX 1/FIX 2 pedian moverse mas que la zona muerta de posicion
+//     pero cada muestra solo sumaba 2 grados, asi que el MPU casi nunca movia.)
 //   - FIX 3: MPU cada 80 ms
 //   - FIX 4: zona muerta del acelerometro 6000
 //   - FIX 5: media movil de 5 muestras
@@ -17,15 +20,22 @@
 //     Asi el executor nunca se queda sin tiempo y no se pierde el agente.
 //   - Servos y sensores funcionan aunque el agente este desconectado.
 //
+// Alimentacion:
+//   - Al arrancar los servos se activan uno por uno (ARRANQUE_ESCALONADO_MS)
+//     para no tumbar la fuente con el pico de los 6 a la vez.
+//   - Un servo apagado no recibe pulsos: queda suelto y casi no consume.
+//
 // Topics (namespace /brazo):
 //   Suscripciones:
 //     /brazo/tecla      std_msgs/String           mismas teclas que en Thonny (w s a d q e z c r f, espacio)
 //     /brazo/servo      std_msgs/Int32MultiArray  [servo, angulo] | [servo, angulo, vel] | [a1..a6]
 //     /brazo/garra      std_msgs/Bool             true = cerrar, false = abrir
+//     /brazo/activar    std_msgs/Int32MultiArray  [servo, 0|1] | [a1..a6] con 0 = apagado, 1 = activo
 //   Publicaciones:
 //     /brazo/estado     std_msgs/Int32MultiArray  angulos actuales [s1..s6]
 //     /brazo/distancia  std_msgs/Int32            VL53L0X en mm
 //     /brazo/imu        std_msgs/Int32MultiArray  [acc_x, acc_y] filtrados (equivale a DEBUG_S1)
+//     /brazo/diag       std_msgs/String           dispositivos I2C, sensores y servos activos
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -58,17 +68,16 @@ struct ConfigServo {
   int max_us;
   int lim_min;
   int lim_max;
-  int zona_muerta;  // FIX 1: ANGULO_ZONA_MUERTA_POR_SERVO
 };
 
 // Indice 0 = servo 1 ... indice 5 = servo 6
 const ConfigServo CONFIG_SERVOS[NUM_SERVOS] = {
-  {15, 600,  2400, 15, 165, 5},  // servo 1: FIX 6/7
-  {2,  800,  2500, 70, 180, 3},
-  {4,  500,  1000, 0,  180, 3},
-  {16, 900,  2000, 0,  180, 3},
-  {17, 500,  2500, 0,  180, 3},
-  {5,  1100, 2700, 0,  180, 3},
+  {15, 600,  2400, 15, 165},  // servo 1: FIX 6/7
+  {2,  800,  2500, 70, 180},
+  {4,  500,  1000, 0,  180},
+  {16, 900,  2000, 0,  180},
+  {17, 500,  2500, 0,  180},
+  {5,  1100, 2700, 0,  180},
 };
 
 const int STEP = 2;
@@ -96,9 +105,20 @@ const uint8_t MPU_ADDR = 0x68;
 const uint32_t MPU_SAMPLE_MS = 80;  // FIX 3
 const int ZONA_MUERTA = 6000;       // FIX 4
 const int ACC_BUFFER_SIZE = 5;      // FIX 5
+const int MPU_PASO = 2;             // grados por muestra: 2 cada 80 ms = 25 grados/s
+// Servo que mueve cada eje del MPU y su sentido (cambiar el signo para invertirlo).
+// En Thonny el eje Y movia el servo 3; en el brazo real subir/bajar es el servo 2.
+const int MPU_SERVO_X = 1, MPU_SIGNO_X = +1;  // inclinar a los lados: gira la base
+const int MPU_SERVO_Y = 2, MPU_SIGNO_Y = +1;  // inclinar adelante/atras: sube/baja
+
+// Alimentacion de servos
+const uint32_t ARRANQUE_ESCALONADO_MS = 700;
 
 // Telemetria
 const uint32_t ESTADO_PUB_MS = 100;
+const uint32_t DIAG_PUB_MS = 2000;
+const uint32_t REINTENTO_SENSORES_MS = 3000;
+const uint8_t TOF_ADDR = 0x29;
 
 // =========================================================
 // SERVOS: PWM + movimiento suave no bloqueante
@@ -112,6 +132,11 @@ struct Movimiento {
 };
 
 Movimiento mov[NUM_SERVOS];
+bool activo[NUM_SERVOS] = {false};
+
+// Arranque escalonado: siguiente servo por activar (> NUM_SERVOS = terminado)
+int siguiente_activar = 1;
+uint32_t ultimo_activar_ms = 0;
 
 const ConfigServo &cfg(int servo) { return CONFIG_SERVOS[servo - 1]; }
 
@@ -128,14 +153,32 @@ int anguloAMicros(int servo, int angulo) {
   return (int)(c.min_us + (c.max_us - c.min_us) * (angulo / 180.0f));
 }
 
-void escribirServo(int servo, int angulo) {
-  uint32_t us = anguloAMicros(servo, angulo);
-  uint32_t duty = (uint32_t)((uint64_t)us * ((1u << PWM_BITS) - 1) / PERIOD_US);
+void escribirDuty(int servo, uint32_t duty) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(cfg(servo).pin, duty);
 #else
   ledcWrite(servo - 1, duty);
 #endif
+}
+
+void escribirServo(int servo, int angulo) {
+  if (!activo[servo - 1]) return;  // apagado: sin pulsos
+  uint32_t us = anguloAMicros(servo, angulo);
+  escribirDuty(servo, (uint32_t)((uint64_t)us * ((1u << PWM_BITS) - 1) / PERIOD_US));
+}
+
+// Al activarse, el servo va a la ultima posicion guardada
+void activarServo(int servo, bool on) {
+  activo[servo - 1] = on;
+  if (on) escribirServo(servo, mov[servo - 1].actual);
+  else escribirDuty(servo, 0);
+}
+
+void arranqueEscalonado(uint32_t ahora) {
+  if (siguiente_activar > NUM_SERVOS || ahora - ultimo_activar_ms < ARRANQUE_ESCALONADO_MS) return;
+  ultimo_activar_ms = ahora;
+  activarServo(siguiente_activar, true);
+  siguiente_activar++;
 }
 
 void iniciarServo(int servo) {
@@ -145,14 +188,6 @@ void iniciarServo(int servo) {
   ledcSetup(servo - 1, FREQ, PWM_BITS);
   ledcAttachPin(cfg(servo).pin, servo - 1);
 #endif
-}
-
-void moverServoInmediato(int servo, int angulo) {
-  angulo = limitar(servo, angulo);
-  escribirServo(servo, angulo);
-  Movimiento &m = mov[servo - 1];
-  m.actual = angulo;
-  m.objetivo = angulo;  // cancela cualquier movimiento suave en curso
 }
 
 // Equivalente a mover_servo_suave(), pero solo fija el objetivo;
@@ -192,11 +227,6 @@ void actualizarMovimientos() {
     m.actual += diff > 0 ? paso : -paso;
     escribirServo(i + 1, m.actual);
   }
-}
-
-// FIX 1
-bool necesitaMover(int servo, int angulo_objetivo) {
-  return abs(angulo_objetivo - mov[servo - 1].actual) > cfg(servo).zona_muerta;
 }
 
 // FIX 8: si el angulo cae en una zona problematica lo saca al borde.
@@ -325,6 +355,17 @@ void muestrearTof(uint32_t ahora) {
   }
 }
 
+// Mientras el eje este inclinado mas alla de ZONA_MUERTA, el servo avanza.
+// Se suma sobre el objetivo (no sobre la posicion actual) para que el avance
+// se acumule muestra a muestra mientras dure la inclinacion.
+void moverPorInclinacion(int32_t acc, int servo, int signo) {
+  if (acc <= ZONA_MUERTA && acc >= -ZONA_MUERTA) return;
+  int dir = (acc > 0 ? +1 : -1) * signo;
+  int nuevo = mov[servo - 1].objetivo + dir * MPU_PASO;
+  if (servo == 1) nuevo = anguloSeguroS1(nuevo, dir);  // FIX 8
+  moverServoSuave(servo, nuevo, VEL, PASO);
+}
+
 // ANTI-TEMBLOR COMPLETO
 void muestrearMpu(uint32_t ahora) {
   if (!mpu_ok || ahora - last_mpu_ms < MPU_SAMPLE_MS) return;
@@ -334,19 +375,44 @@ void muestrearMpu(uint32_t ahora) {
   filtrarAcc(rx, ry, acc_x, acc_y);
   imu_nueva = true;
 
-  // ---- Servo 1 (eje X) ----
-  if (acc_x > ZONA_MUERTA || acc_x < -ZONA_MUERTA) {
-    int dir = acc_x > 0 ? +1 : -1;
-    int nuevo = anguloSeguroS1(mov[0].actual + dir * STEP, dir);  // FIX 8
-    if (necesitaMover(1, nuevo)) moverServoInmediato(1, nuevo);    // FIX 1 + FIX 2
-  }
+  moverPorInclinacion(acc_x, MPU_SERVO_X, MPU_SIGNO_X);
+  moverPorInclinacion(acc_y, MPU_SERVO_Y, MPU_SIGNO_Y);
+}
 
-  // ---- Servo 3 (eje Y) ----
-  if (acc_y > ZONA_MUERTA || acc_y < -ZONA_MUERTA) {
-    int dir = acc_y > 0 ? +1 : -1;
-    int nuevo3 = mov[2].actual + dir * STEP;
-    if (necesitaMover(3, nuevo3)) moverServoInmediato(3, nuevo3);
+// Diagnostico I2C: direcciones que responden, p. ej. "0x29 0x68"
+char i2c_encontrados[48] = "sin escanear";
+bool hay_tof = false, hay_mpu = false;
+
+void escanearI2C() {
+  size_t n = 0;
+  hay_tof = hay_mpu = false;
+  i2c_encontrados[0] = '\0';
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t r = Wire.endTransmission();
+    if (r == 0) {
+      if (addr == TOF_ADDR) hay_tof = true;
+      if (addr == MPU_ADDR) hay_mpu = true;
+      if (n < sizeof(i2c_encontrados))
+        n += snprintf(i2c_encontrados + n, sizeof(i2c_encontrados) - n, "%s0x%02X", n ? " " : "", addr);
+    } else if (r != 2) {
+      // Timeout u otro error: bus trabado (SDA/SCL en corto, sin GND comun o sin pull-ups)
+      snprintf(i2c_encontrados, sizeof(i2c_encontrados), "error de bus (codigo %u)", r);
+      hay_tof = hay_mpu = false;
+      return;
+    }
   }
+  if (n == 0) snprintf(i2c_encontrados, sizeof(i2c_encontrados), "ninguno");
+}
+
+// Si un sensor no arranco (o se conecto despues), se reintenta cada pocos segundos
+void reintentarSensores(uint32_t ahora) {
+  static uint32_t ultimo = 0;
+  if ((tof_ok && mpu_ok) || ahora - ultimo < REINTENTO_SENSORES_MS) return;
+  ultimo = ahora;
+  escanearI2C();
+  if (!tof_ok && hay_tof) tofIniciar();
+  if (!mpu_ok && hay_mpu) mpu_ok = mpuIniciar();
 }
 
 // =========================================================
@@ -358,20 +424,24 @@ rcl_node_t node;
 rclc_executor_t executor;
 bool support_iniciado = false;
 
-rcl_subscription_t sub_tecla, sub_servo, sub_garra;
-rcl_publisher_t pub_estado, pub_distancia, pub_imu;
+rcl_subscription_t sub_tecla, sub_servo, sub_garra, sub_activar;
+rcl_publisher_t pub_estado, pub_distancia, pub_imu, pub_diag;
 
 std_msgs__msg__String msg_tecla;
 char buf_tecla[32];
 std_msgs__msg__Int32MultiArray msg_servo;
 int32_t buf_servo[8];
 std_msgs__msg__Bool msg_garra;
+std_msgs__msg__Int32MultiArray msg_activar;
+int32_t buf_activar[8];
 
 std_msgs__msg__Int32MultiArray msg_estado;
 int32_t buf_estado[NUM_SERVOS];
 std_msgs__msg__Int32 msg_distancia;
 std_msgs__msg__Int32MultiArray msg_imu;
 int32_t buf_imu[2];
+std_msgs__msg__String msg_diag;
+char buf_diag[128];
 
 enum EstadoAgente { ESPERANDO_AGENTE, AGENTE_DISPONIBLE, AGENTE_CONECTADO, AGENTE_DESCONECTADO };
 EstadoAgente estado_agente = ESPERANDO_AGENTE;
@@ -407,6 +477,18 @@ void cbGarra(const void *msgin) {
   moverServoSuave(6, grip_closed ? GRIP_CLOSE_ANG : GRIP_OPEN_ANG, VEL, PASO);
 }
 
+void cbActivar(const void *msgin) {
+  const std_msgs__msg__Int32MultiArray *m = (const std_msgs__msg__Int32MultiArray *)msgin;
+  const int32_t *d = m->data.data;
+  siguiente_activar = NUM_SERVOS + 1;  // un comando manual cancela el arranque escalonado
+  if (m->data.size == 2) {
+    if (d[0] < 1 || d[0] > NUM_SERVOS) return;
+    activarServo(d[0], d[1] != 0);
+  } else if (m->data.size == NUM_SERVOS) {
+    for (int i = 0; i < NUM_SERVOS; i++) activarServo(i + 1, d[i] != 0);
+  }
+}
+
 void prepararMensajes() {
   msg_tecla.data.data = buf_tecla;
   msg_tecla.data.capacity = sizeof(buf_tecla);
@@ -415,6 +497,14 @@ void prepararMensajes() {
   msg_servo.data.data = buf_servo;
   msg_servo.data.capacity = sizeof(buf_servo) / sizeof(buf_servo[0]);
   msg_servo.data.size = 0;
+
+  msg_activar.data.data = buf_activar;
+  msg_activar.data.capacity = sizeof(buf_activar) / sizeof(buf_activar[0]);
+  msg_activar.data.size = 0;
+
+  msg_diag.data.data = buf_diag;
+  msg_diag.data.capacity = sizeof(buf_diag);
+  msg_diag.data.size = 0;
 
   msg_estado.data.data = buf_estado;
   msg_estado.data.capacity = NUM_SERVOS;
@@ -434,9 +524,11 @@ bool crearEntidades() {
   sub_tecla = rcl_get_zero_initialized_subscription();
   sub_servo = rcl_get_zero_initialized_subscription();
   sub_garra = rcl_get_zero_initialized_subscription();
+  sub_activar = rcl_get_zero_initialized_subscription();
   pub_estado = rcl_get_zero_initialized_publisher();
   pub_distancia = rcl_get_zero_initialized_publisher();
   pub_imu = rcl_get_zero_initialized_publisher();
+  pub_diag = rcl_get_zero_initialized_publisher();
 
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
   support_iniciado = true;
@@ -448,6 +540,8 @@ bool crearEntidades() {
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray), "brazo/servo"));
   RCCHECK(rclc_subscription_init_default(&sub_garra, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "brazo/garra"));
+  RCCHECK(rclc_subscription_init_default(&sub_activar, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray), "brazo/activar"));
 
   // Best effort: un publish reliable puede bloquear esperando confirmacion
   RCCHECK(rclc_publisher_init_best_effort(&pub_estado, &node,
@@ -456,11 +550,14 @@ bool crearEntidades() {
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "brazo/distancia"));
   RCCHECK(rclc_publisher_init_best_effort(&pub_imu, &node,
           ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray), "brazo/imu"));
+  RCCHECK(rclc_publisher_init_best_effort(&pub_diag, &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "brazo/diag"));
 
-  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
   RCCHECK(rclc_executor_add_subscription(&executor, &sub_tecla, &msg_tecla, &cbTecla, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &sub_servo, &msg_servo, &cbServo, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &sub_garra, &msg_garra, &cbGarra, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(&executor, &sub_activar, &msg_activar, &cbActivar, ON_NEW_DATA));
   return true;
 }
 
@@ -472,9 +569,11 @@ void destruirEntidades() {
   (void)rcl_publisher_fini(&pub_estado, &node);
   (void)rcl_publisher_fini(&pub_distancia, &node);
   (void)rcl_publisher_fini(&pub_imu, &node);
+  (void)rcl_publisher_fini(&pub_diag, &node);
   (void)rcl_subscription_fini(&sub_tecla, &node);
   (void)rcl_subscription_fini(&sub_servo, &node);
   (void)rcl_subscription_fini(&sub_garra, &node);
+  (void)rcl_subscription_fini(&sub_activar, &node);
   (void)rclc_executor_fini(&executor);
   (void)rcl_node_fini(&node);
   if (support_iniciado) (void)rclc_support_fini(&support);
@@ -498,6 +597,17 @@ void publicarTelemetria(uint32_t ahora) {
     buf_imu[0] = acc_x;
     buf_imu[1] = acc_y;
     (void)rcl_publish(&pub_imu, &msg_imu, NULL);
+  }
+  static uint32_t ultimo_diag = 0;
+  if (ahora - ultimo_diag >= DIAG_PUB_MS) {
+    ultimo_diag = ahora;
+    char activos[NUM_SERVOS + 1];
+    for (int i = 0; i < NUM_SERVOS; i++) activos[i] = activo[i] ? '1' : '0';
+    activos[NUM_SERVOS] = '\0';
+    int n = snprintf(buf_diag, sizeof(buf_diag), "i2c: %s | tof: %s | mpu: %s | servos activos: %s",
+                     i2c_encontrados, tof_ok ? "ok" : "no", mpu_ok ? "ok" : "no", activos);
+    msg_diag.data.size = min((size_t)n, sizeof(buf_diag) - 1);
+    (void)rcl_publish(&pub_diag, &msg_diag, NULL);
   }
 }
 
@@ -540,19 +650,20 @@ void gestionarMicroRos(uint32_t ahora) {
 
 // ----- SETUP / LOOP -----
 void setup() {
-  // Servos al centro de sus limites (equivale a la inicializacion + init_pos())
+  // Posicion inicial al centro de sus limites (equivale a init_pos()).
+  // Los pulsos empiezan servo por servo desde arranqueEscalonado().
   for (int s = 1; s <= NUM_SERVOS; s++) {
     iniciarServo(s);
     const ConfigServo &c = cfg(s);
     int centro = (c.lim_min + c.lim_max) / 2;
     mov[s - 1] = {centro, centro, PASO, 0, 0};
-    escribirServo(s, centro);
-    delay(10);
   }
 
   Wire.begin(21, 22, 100000);
-  tofIniciar();
-  mpu_ok = mpuIniciar();
+  Wire.setTimeOut(20);  // un bus trabado no debe congelar el loop
+  escanearI2C();
+  if (hay_tof) tofIniciar();
+  if (hay_mpu) mpu_ok = mpuIniciar();
 
   // El puerto serie queda reservado para micro-ROS: no usar Serial.print()
   Serial.begin(115200);
@@ -563,7 +674,9 @@ void setup() {
 void loop() {
   uint32_t ahora = millis();
   gestionarMicroRos(ahora);
+  arranqueEscalonado(ahora);
   actualizarMovimientos();
+  reintentarSensores(ahora);
   muestrearTof(ahora);
   muestrearMpu(ahora);
 }

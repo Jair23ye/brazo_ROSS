@@ -71,7 +71,8 @@ def main():
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, viejo)
         print()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():  # con Ctrl+C, rclpy ya cerro el contexto
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

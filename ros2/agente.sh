@@ -40,8 +40,8 @@ fi
 # que board_microros_distro en platformio.ini (humble).
 if ! docker info > /dev/null 2>&1; then
   echo ">> No hay ROS 2 Humble y Docker no esta disponible. Una sola vez:"
-  echo "     sudo systemctl enable --now docker"
   echo "     sudo usermod -aG docker,uucp \$USER    (luego cerrar sesion y volver a entrar)"
+  echo ">> Si ya lo hiciste y no has cerrado sesion: corre 'newgrp docker' en esta terminal."
   exit 1
 fi
 [ -e "$DEV" ] || echo ">> $DEV no existe todavia; el agente esperara a que se conecte el ESP32."

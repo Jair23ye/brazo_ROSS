@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-# teleop_mando.py -- control del brazo con un mando Xbox via ROS 2 (WSL)
-# El mando se lee en Windows con mando_xinput.py (XInput) y aqui se traduce a las
+# teleop_mando.py -- control del brazo con un mando Xbox via ROS 2 (Linux)
+# El mando se lee de /dev/input con mando_linux.py y aqui se traduce a las
 # mismas teclas que entiende el firmware en /brazo/tecla (2 grados por tecla).
 # Mientras mas se inclina el stick, mas teclas por segundo: mas velocidad.
 #
-# Uso:  python3 teleop_mando.py
+# Uso:  python3 teleop_mando.py      (o, sin ROS 2 instalado: bash teleop.sh mando)
 
 import os
 import subprocess
+import sys
 import time
 
 # Fast DDS solo por UDP: en este WSL la memoria compartida deja de entregar datos.
@@ -18,13 +19,6 @@ os.environ.setdefault("FASTRTPS_DEFAULT_PROFILES_FILE", os.path.join(DIR, "fastd
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Int32MultiArray, String
-
-# Python de Windows que lee el mando (el de PlatformIO siempre esta en este proyecto)
-PYTHONS_WINDOWS = [
-    os.environ.get("BRAZO_PYTHON_WINDOWS", ""),
-    "/mnt/c/Users/Mauricio/.platformio/penv/Scripts/python.exe",
-    "/mnt/c/Users/Mauricio/AppData/Local/Python/bin/python.exe",
-]
 
 AYUDA = """
 Control del brazo con mando Xbox (Ctrl+C para salir)
@@ -65,13 +59,9 @@ def teclas_por_segundo(valor, zona, maximo):
 
 
 def lanzar_lector():
-    python = next((p for p in PYTHONS_WINDOWS if p and os.path.exists(p)), None)
-    if python is None:
-        raise SystemExit("No encontre Python de Windows; define BRAZO_PYTHON_WINDOWS")
-    script = subprocess.check_output(
-        ["wslpath", "-w", os.path.join(DIR, "mando_xinput.py")], text=True).strip()
-    return subprocess.Popen([python, "-u", script], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    # stderr se deja pasar: ahi avisa si no tiene permiso para leer el mando
+    return subprocess.Popen([sys.executable, "-u", os.path.join(DIR, "mando_linux.py")],
+                            stdout=subprocess.PIPE, text=True, bufsize=1)
 
 
 def main():
@@ -101,7 +91,7 @@ def main():
         while rclpy.ok():
             linea = lector.stdout.readline()
             if not linea:
-                print("\nSe cerro el lector del mando en Windows.")
+                print("\nSe cerro el lector del mando.")
                 break
             ahora = time.monotonic()
             dt = min(ahora - ultimo, 0.1)

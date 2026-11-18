@@ -25,6 +25,13 @@
 //     para no tumbar la fuente con el pico de los 6 a la vez.
 //   - Un servo apagado no recibe pulsos: queda suelto y casi no consume.
 //
+// Regreso lento a "inicio" al arrancar:
+//   - Los servos no dicen donde estan, asi que su ultima posicion se guarda en
+//     flash (NVS) cuando llevan GUARDAR_QUIETO_MS quietos. Al arrancar, el primer
+//     pulso va a esa posicion (sin salto) y de ahi van a "inicio" a VEL_REGRESO.
+//   - Se guarda como pulso (us), no como angulo: sigue valiendo aunque se
+//     recalibre un servo (cero, sentido, min_us, max_us).
+//
 // Topics (namespace /brazo):
 //   Suscripciones:
 //     /brazo/tecla      std_msgs/String           mismas teclas que en Thonny (w s a d q e z c r f, espacio)
@@ -41,6 +48,7 @@
 #include <Wire.h>
 #include <esp_arduino_version.h>
 #include <VL53L0X.h>
+#include <Preferences.h>
 
 #include <micro_ros_platformio.h>
 #include <rcl/rcl.h>
@@ -62,22 +70,36 @@ const int PERIOD_US = 20000;
 const int PWM_BITS = 16;
 const int NUM_SERVOS = 6;
 
+// Escala fisica: 0..180 grados = min_us..max_us (fuera de ese rango se extrapola).
+// El angulo que se ve en topics y teclas es: fisico = cero + sentido * angulo.
+// Con sentido = -1 el servo gira al reves (montado en espejo).
+// lim_min, lim_max e inicio van en el angulo que se ve.
 struct ConfigServo {
   uint8_t pin;
   int min_us;
   int max_us;
   int lim_min;
   int lim_max;
+  int inicio;   // angulo al arrancar
+  int cero;     // angulo fisico donde se ve 0
+  int sentido;  // +1 normal, -1 invertido
 };
 
 // Indice 0 = servo 1 ... indice 5 = servo 6
 const ConfigServo CONFIG_SERVOS[NUM_SERVOS] = {
-  {15, 600,  2400, 15, 165},  // servo 1: FIX 6/7
-  {2,  800,  2500, 70, 180},
-  {4,  500,  1000, 0,  180},
-  {16, 900,  2000, 0,  180},
-  {17, 500,  2500, 0,  180},
-  {5,  1100, 2700, 0,  180},
+  //pin min_us max_us lim_min lim_max inicio cero sentido
+  // Inicios = postura de reposo elegida en el brazo real: [74, 100, 106, 100, 90, 90].
+  // servo 1: tope fisico en 42 -> minimo 44. Maximo 198 (2580 us): probado sin
+  // topar. Arriba de 180 el pulso sigue la misma escala (10 us por grado).
+  {15, 600,  2400, 44,   198, 74,  0,  +1},
+  // servo 2 (codo): invertido tras el ajuste fisico. 0 = antebrazo recto (fisico 70).
+  // "w" (levantar) -> negativos hasta -110 (fisico 180, 2500 us).
+  // "s" (bajar)    -> positivos hasta 100 (516 us, cerca del minimo del servo).
+  {2,  800,  2500, -110, 100, 100, 70, -1},
+  {4,  500,  1000, 0,    180, 106, 0,  +1},
+  {16, 900,  2000, 0,    180, 100, 0,  +1},
+  {17, 500,  2500, 0,    180, 90, 0,  +1},
+  {5,  1100, 2700, 0,    180, 90, 0,  +1},
 };
 
 const int STEP = 2;
@@ -93,7 +115,7 @@ struct Zona { int min; int max; };
 const Zona ZONAS_PROBLEMATICAS_S1[] = {
   {85, 95},    // zona tipica de punto muerto mecanico central
   {0,  20},    // extremo inferior (alta carga mecanica)
-  {160, 180},  // extremo superior (alta carga mecanica)
+  // {160, 180} quitada tras el ajuste fisico: el servo 1 necesita bajar mas de 159
 };
 
 // VL53L0X
@@ -113,6 +135,8 @@ const int MPU_SERVO_Y = 2, MPU_SIGNO_Y = +1;  // inclinar adelante/atras: sube/b
 
 // Alimentacion de servos
 const uint32_t ARRANQUE_ESCALONADO_MS = 700;
+const float VEL_REGRESO = 15.0f;            // grados/s del regreso a "inicio" al arrancar
+const uint32_t GUARDAR_QUIETO_MS = 1000;    // quietos este tiempo -> se guarda la posicion
 
 // Telemetria
 const uint32_t ESTADO_PUB_MS = 100;
@@ -147,10 +171,23 @@ int limitar(int servo, int angulo) {
   return angulo;
 }
 
+// Pulso de un angulo fisico (escala 0..180 = min_us..max_us)
+int fisicoAMicros(int servo, float fisico) {
+  const ConfigServo &c = cfg(servo);
+  return (int)(c.min_us + (c.max_us - c.min_us) * (fisico / 180.0f));
+}
+
 int anguloAMicros(int servo, int angulo) {
   const ConfigServo &c = cfg(servo);
   angulo = limitar(servo, angulo);
-  return (int)(c.min_us + (c.max_us - c.min_us) * (angulo / 180.0f));
+  return fisicoAMicros(servo, c.cero + c.sentido * angulo);
+}
+
+// Inverso de anguloAMicros (sin limitar), para recuperar la posicion guardada
+int microsAAngulo(int servo, int us) {
+  const ConfigServo &c = cfg(servo);
+  float fisico = (us - c.min_us) * 180.0f / (c.max_us - c.min_us);
+  return (int)lroundf((fisico - c.cero) * c.sentido);
 }
 
 void escribirDuty(int servo, uint32_t duty) {
@@ -172,13 +209,6 @@ void activarServo(int servo, bool on) {
   activo[servo - 1] = on;
   if (on) escribirServo(servo, mov[servo - 1].actual);
   else escribirDuty(servo, 0);
-}
-
-void arranqueEscalonado(uint32_t ahora) {
-  if (siguiente_activar > NUM_SERVOS || ahora - ultimo_activar_ms < ARRANQUE_ESCALONADO_MS) return;
-  ultimo_activar_ms = ahora;
-  activarServo(siguiente_activar, true);
-  siguiente_activar++;
 }
 
 void iniciarServo(int servo) {
@@ -227,6 +257,55 @@ void actualizarMovimientos() {
     m.actual += diff > 0 ? paso : -paso;
     escribirServo(i + 1, m.actual);
   }
+}
+
+// Arranque: cada servo recibe su primer pulso donde quedo (ultima posicion
+// guardada, sin salto) y de ahi va despacio a su "inicio".
+void arranqueEscalonado(uint32_t ahora) {
+  if (siguiente_activar > NUM_SERVOS || ahora - ultimo_activar_ms < ARRANQUE_ESCALONADO_MS) return;
+  ultimo_activar_ms = ahora;
+  int servo = siguiente_activar++;
+  activarServo(servo, true);
+  moverServoSuave(servo, cfg(servo).inicio, VEL_REGRESO, PASO);
+}
+
+// Ultimas posiciones en flash (NVS), como pulso en us. Se escriben solo cuando
+// todos los servos llevan GUARDAR_QUIETO_MS quietos y algo cambio, para no gastar la flash.
+Preferences prefs;
+int16_t pos_guardadas[NUM_SERVOS];  // angulos de la ultima vez que se guardo
+uint32_t ultimo_movimiento_ms = 0;
+
+bool cargarPosiciones(int pos[NUM_SERVOS]) {
+  int16_t buf[NUM_SERVOS];
+  if (prefs.getBytes("us", buf, sizeof(buf)) == sizeof(buf)) {
+    for (int i = 0; i < NUM_SERVOS; i++) pos[i] = microsAAngulo(i + 1, buf[i]);
+    return true;
+  }
+  // Version anterior del firmware: guardaba angulos fisicos (sin cero ni sentido)
+  if (prefs.getBytes("pos", buf, sizeof(buf)) == sizeof(buf)) {
+    for (int i = 0; i < NUM_SERVOS; i++) pos[i] = microsAAngulo(i + 1, fisicoAMicros(i + 1, buf[i]));
+    return true;
+  }
+  return false;  // primera vez
+}
+
+void guardarPosiciones(uint32_t ahora) {
+  bool cambio = false;
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    if (mov[i].actual != mov[i].objetivo) {
+      ultimo_movimiento_ms = ahora;  // todavia se mueve
+      return;
+    }
+    if (mov[i].actual != pos_guardadas[i]) cambio = true;
+  }
+  if (!cambio || ahora - ultimo_movimiento_ms < GUARDAR_QUIETO_MS) return;
+  int16_t us[NUM_SERVOS];
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    pos_guardadas[i] = mov[i].actual;
+    us[i] = anguloAMicros(i + 1, mov[i].actual);
+  }
+  prefs.putBytes("us", us, sizeof(us));
+  if (prefs.isKey("pos")) prefs.remove("pos");  // formato anterior ya convertido
 }
 
 // FIX 8: si el angulo cae en una zona problematica lo saca al borde.
@@ -650,13 +729,17 @@ void gestionarMicroRos(uint32_t ahora) {
 
 // ----- SETUP / LOOP -----
 void setup() {
-  // Posicion inicial al centro de sus limites (equivale a init_pos()).
-  // Los pulsos empiezan servo por servo desde arranqueEscalonado().
+  // Cada servo parte de su ultima posicion guardada (o de "inicio" la primera vez).
+  // Los pulsos empiezan servo por servo desde arranqueEscalonado(), que los lleva
+  // despacio a "inicio" (equivale a init_pos()).
+  prefs.begin("brazo", false);
+  int guardada[NUM_SERVOS];
+  bool hay_guardada = cargarPosiciones(guardada);
   for (int s = 1; s <= NUM_SERVOS; s++) {
     iniciarServo(s);
-    const ConfigServo &c = cfg(s);
-    int centro = (c.lim_min + c.lim_max) / 2;
-    mov[s - 1] = {centro, centro, PASO, 0, 0};
+    int desde = limitar(s, hay_guardada ? guardada[s - 1] : cfg(s).inicio);
+    mov[s - 1] = {desde, desde, PASO, 0, 0};
+    pos_guardadas[s - 1] = desde;
   }
 
   Wire.begin(21, 22, 100000);
@@ -676,6 +759,7 @@ void loop() {
   gestionarMicroRos(ahora);
   arranqueEscalonado(ahora);
   actualizarMovimientos();
+  guardarPosiciones(ahora);
   reintentarSensores(ahora);
   muestrearTof(ahora);
   muestrearMpu(ahora);

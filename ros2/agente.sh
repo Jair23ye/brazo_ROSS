@@ -45,6 +45,8 @@ if ! docker info > /dev/null 2>&1; then
   exit 1
 fi
 [ -e "$DEV" ] || echo ">> $DEV no existe todavia; el agente esperara a que se conecte el ESP32."
+# Esta placa (CH9102) no se reinicia sola al abrir el puerto ni despues de subir firmware.
+echo ">> Si en unos segundos no aparece 'session established', presiona EN en el ESP32."
 # /dev completo + privileged: si el ESP32 se reconecta, el agente lo vuelve a ver.
 # Mismo perfil solo-UDP que en WSL: el contenedor no comparte memoria con los
 # nodos de fuera (MICROROS_DISABLE_SHM=0 evita que la imagen ponga el suyo).

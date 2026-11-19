@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-# teleop_mando.py -- control del brazo con un mando Xbox via ROS 2 (Linux)
-# El mando se lee de /dev/input con mando_linux.py y aqui se traduce:
+# teleop_mando.py -- control del brazo con un mando Xbox via ROS 2 (Linux / WSL)
+# El mando se lee con:
+#   - WSL (Windows): mando_xinput.py, corriendo en el Python de Windows (XInput),
+#     porque WSL no ve el mando en /dev/input.
+#   - Linux nativo:  mando_linux.py, de /dev/input.
+# Los dos imprimen lo mismo; aqui se traduce:
 #   - Servos: a las mismas teclas que entiende el firmware en /brazo/tecla
 #     (2 grados por tecla). Mientras mas se inclina el stick, mas teclas por
 #     segundo: mas velocidad.
@@ -23,6 +27,13 @@ os.environ.setdefault("FASTRTPS_DEFAULT_PROFILES_FILE", os.path.join(DIR, "fastd
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Int32, Int32MultiArray, String
+
+# WSL: Python de Windows que lee el mando (el de PlatformIO siempre esta en este proyecto)
+PYTHONS_WINDOWS = [
+    os.environ.get("BRAZO_PYTHON_WINDOWS", ""),
+    "/mnt/c/Users/Mauricio/.platformio/penv/Scripts/python.exe",
+    "/mnt/c/Users/Mauricio/AppData/Local/Python/bin/python.exe",
+]
 
 AYUDA = """
 Control del brazo con mando Xbox (Ctrl+C para salir)
@@ -87,7 +98,25 @@ def texto_estado(angulos):
     return "S1-S5: {}".format(angulos)
 
 
+def en_wsl():
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 def lanzar_lector():
+    if en_wsl():
+        python = next((p for p in PYTHONS_WINDOWS if p and os.path.exists(p)), None)
+        if python is None:
+            raise SystemExit("No encontre Python de Windows; define BRAZO_PYTHON_WINDOWS")
+        script = subprocess.check_output(
+            ["wslpath", "-w", os.path.join(DIR, "mando_xinput.py")], text=True).strip()
+        return subprocess.Popen([python, "-u", script], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
     # stderr se deja pasar: ahi avisa si no tiene permiso para leer el mando
     return subprocess.Popen([sys.executable, "-u", os.path.join(DIR, "mando_linux.py")],
                             stdout=subprocess.PIPE, text=True, bufsize=1)

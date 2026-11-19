@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # teleop_brazo.py -- control por teclado del brazo via ROS 2 (Linux / WSL)
-# Replica el control serie de Thonny: cada tecla se publica en /brazo/tecla
-# y el ESP32 la procesa con la misma tabla de teclas.
+# Cada tecla se publica en /brazo/tecla y el ESP32 la procesa con la misma tabla.
+# La base (NEMA 23) gira mientras se mantiene a/d: el teclado repite la tecla y el
+# ESP32 frena la base cuando deja de llegar.
 # Muestra los angulos que reporta el ESP32 en /brazo/estado.
 #
 # Uso:  source /opt/ros/humble/setup.bash && python3 teleop_brazo.py
@@ -23,17 +24,22 @@ from std_msgs.msg import Int32MultiArray, String
 
 AYUDA = """
 Control del brazo (Ctrl+C para salir)
-  w / s : levantar / bajar (servo 2)   a / d : girar la base (servo 1)
+  a / d : girar la base (NEMA 23) mientras mantengas la tecla
+  x     : soltar / trabar la base (suelta: libre para moverla a mano)
+  w / s : levantar / bajar (servo 2)   t / g : servo 1 +/-
   q / e : servo 3 +/-                  z / c : servo 4 -/+
-  r / f : servo 5 +/-                  espacio : abrir/cerrar garra
+  r / f : cerrar / abrir garra (poco a poco)
 """
 
-TECLAS = set("wsadqezcrf ")
+# El firmware usa estas mismas letras (ya no hace falta remapear como con Thonny)
+TECLAS = set("adxwstgqezcrf")
 
-# Tecla del teleop -> tecla que entiende el firmware (tabla original de Thonny,
-# donde w/s movian el servo 1 y a/d el servo 2). En el brazo real el servo 2
-# sube/baja y el servo 1 gira la base, asi que se intercambian.
-REMAPEO = {"w": "a", "s": "d", "a": "w", "d": "s"}
+
+def texto_estado(angulos):
+    # /brazo/estado = [s1..s5, base]; un firmware anterior manda solo los servos
+    if len(angulos) == 6:
+        return "Base: {:5d} grados   S1-S5: {}".format(angulos[5], angulos[:5])
+    return "S1-S5: {}".format(angulos)
 
 
 def main():
@@ -48,7 +54,7 @@ def main():
             if estado["angulos"] is None:
                 print("ESP32 conectado.")
             estado["angulos"] = angulos
-            print("\rS1-S6: {}      ".format(angulos), end="", flush=True)
+            print("\r" + texto_estado(angulos) + "      ", end="", flush=True)
 
     node.create_subscription(Int32MultiArray, "brazo/estado", cb_estado, qos_profile_sensor_data)
     print(AYUDA)
@@ -63,7 +69,7 @@ def main():
                 if ch in TECLAS:
                     if pub.get_subscription_count() == 0:
                         print("\nEl ESP32 no esta conectado al agente: la tecla no llega.")
-                    pub.publish(String(data=REMAPEO.get(ch, ch)))
+                    pub.publish(String(data=ch))
             rclpy.spin_once(node, timeout_sec=0)
     except KeyboardInterrupt:
         pass
